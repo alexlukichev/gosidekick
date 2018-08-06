@@ -40,11 +40,7 @@ func (v *arrayFlags) Set(value string) error {
 
 var (
 	debug    = flag.Bool("v", false, "verbose output")
-	etcdURL  = flag.String("e", "http://127.0.0.1:2379", "a comma-delimited list of machine addresses in the cluster")
 	interval = flag.Int("i", 15, "refresh interval (sec)")
-	certFile = flag.String("cert-file","", "identify HTTPS client using this SSL certificate file")
-	keyFile  = flag.String("key-file", "", "identify HTTPS client using this SSL key file")
-	caFile   = flag.String("ca-file", "", "verify certificates of HTTPS-enabled servers using this CA bundle")
 	keys     arrayFlags
 	values   arrayFlags
 )
@@ -87,13 +83,25 @@ func main() {
 
 	var transport client.CancelableTransport
 
-	if len(*certFile) > 0 || len(*keyFile) > 0 || len(*caFile) > 0 {
-		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	etcdURL, found := os.LookupEnv("ETCDCTL_ENDPOINT")
+	if !found {
+		etcdURL, found = os.LookupEnv("ETCDCTL_ENDPOINTS")
+		if !found {
+			etcdURL = "http://127.0.0.1:2379"
+		}
+	}
+
+	caFile   := os.Getenv("ETCDCTL_CACERT")
+	keyFile  := os.Getenv("ETCDCTL_KEY_FILE")
+	certFile := os.Getenv("ETCDCTL_CERT_FILE")
+
+	if len(certFile) > 0 || len(keyFile) > 0 || len(caFile) > 0 {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		caCert, err := ioutil.ReadFile(*caFile)
+		caCert, err := ioutil.ReadFile(caFile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -111,13 +119,13 @@ func main() {
 	}
 
 	etcd, err := newEtcdClient(
-		strings.Split(*etcdURL, ","),
+		strings.Split(etcdURL, ","),
 		keys,
 		values,
 		2*time.Duration(*interval)*time.Second,
 		transport)
 	if err != nil {
-		log.Errorf("Cannot connect to etcd at %s: %s", *etcdURL, err.Error())
+		log.Errorf("Cannot connect to etcd at %s: %s", etcdURL, err.Error())
 		os.Exit(1)
 	}
 
