@@ -9,9 +9,13 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
 	"github.com/coreos/etcd/client"
 	"github.com/op/go-logging"
+	"crypto/tls"
+	"io/ioutil"
+	"crypto/x509"
+	"net/http"
+	"strings"
 )
 
 var log = logging.MustGetLogger("sidekick")
@@ -36,8 +40,11 @@ func (v *arrayFlags) Set(value string) error {
 
 var (
 	debug    = flag.Bool("v", false, "verbose output")
-	etcdURL  = flag.String("e", "http://127.0.0.1:2379", "etcd URL")
+	etcdURL  = flag.String("e", "http://127.0.0.1:2379", "a comma-delimited list of machine addresses in the cluster")
 	interval = flag.Int("i", 15, "refresh interval (sec)")
+	certFile = flag.String("cert-file","", "identify HTTPS client using this SSL certificate file")
+	keyFile  = flag.String("key-file", "", "identify HTTPS client using this SSL key file")
+	caFile   = flag.String("ca-file", "", "verify certificates of HTTPS-enabled servers using this CA bundle")
 	keys     arrayFlags
 	values   arrayFlags
 )
@@ -78,11 +85,37 @@ func main() {
 		log.Debugf("Will be publishing: %s ==> %s", keys[i], values[i])
 	}
 
+	var transport client.CancelableTransport
+
+	if len(*certFile) > 0 || len(*keyFile) > 0 || len(*caFile) > 0 {
+		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		caCert, err := ioutil.ReadFile(*caFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      caCertPool,
+		}
+		tlsConfig.BuildNameToCertificate()
+		transport = &http.Transport{TLSClientConfig: tlsConfig}
+	} else {
+		transport = client.DefaultTransport
+	}
+
 	etcd, err := newEtcdClient(
-		*etcdURL,
+		strings.Split(*etcdURL, ","),
 		keys,
 		values,
-		2*time.Duration(*interval)*time.Second)
+		2*time.Duration(*interval)*time.Second,
+		transport)
 	if err != nil {
 		log.Errorf("Cannot connect to etcd at %s: %s", *etcdURL, err.Error())
 		os.Exit(1)
@@ -191,10 +224,10 @@ type etcdClient struct {
 	ttl    time.Duration
 }
 
-func newEtcdClient(url string, keys []string, values []string, ttl time.Duration) (*etcdClient, error) {
+func newEtcdClient(endpoints []string, keys []string, values []string, ttl time.Duration, transport client.CancelableTransport) (*etcdClient, error) {
 	cfg := client.Config{
-		Endpoints: []string{url},
-		Transport: client.DefaultTransport,
+		Endpoints: endpoints,
+		Transport: transport,
 		// set timeout per request to fail fast when the target endpoint is unavailable
 		HeaderTimeoutPerRequest: 5 * time.Second,
 	}
