@@ -2,20 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
+
 	"github.com/coreos/etcd/client"
 	"github.com/op/go-logging"
-	"crypto/tls"
-	"io/ioutil"
-	"crypto/x509"
-	"net/http"
-	"strings"
 )
 
 var log = logging.MustGetLogger("sidekick")
@@ -54,6 +56,8 @@ var usage = func() {
 
 func main() {
 
+	var err error
+
 	flag.Var(&keys, "k", "destination etcd key (miltiple occurences allowed)")
 	flag.Var(&values, "p", "destination etcd entry value (multiple occurences allowed, must correspond to -k)")
 
@@ -91,8 +95,8 @@ func main() {
 		}
 	}
 
-	caFile   := os.Getenv("ETCDCTL_CACERT")
-	keyFile  := os.Getenv("ETCDCTL_KEY_FILE")
+	caFile := os.Getenv("ETCDCTL_CACERT")
+	keyFile := os.Getenv("ETCDCTL_KEY_FILE")
 	certFile := os.Getenv("ETCDCTL_CERT_FILE")
 
 	if len(certFile) > 0 || len(keyFile) > 0 || len(caFile) > 0 {
@@ -118,12 +122,24 @@ func main() {
 		transport = client.DefaultTransport
 	}
 
+	var etcdTimeoutSec int
+	etcdTimeoutSecStr := os.Getenv("ETCD_TIMEOUT_SEC")
+	if etcdTimeoutSecStr != "" {
+		etcdTimeoutSec, err = strconv.Atoi(etcdTimeoutSecStr)
+		if err != nil {
+			log.Fatal("Invalid timeout value: %v", err)
+		}
+	} else {
+		etcdTimeoutSec = 5
+	}
+
 	etcd, err := newEtcdClient(
 		strings.Split(etcdURL, ","),
 		keys,
 		values,
 		2*time.Duration(*interval)*time.Second,
-		transport)
+		transport,
+		time.Duration(etcdTimeoutSec)*time.Second)
 	if err != nil {
 		log.Errorf("Cannot connect to etcd at %s: %s", etcdURL, err.Error())
 		os.Exit(1)
@@ -226,13 +242,14 @@ func (p *process) signal(sig os.Signal) (chan int, error) {
 }
 
 type etcdClient struct {
-	kapi   client.KeysAPI
-	keys   []string
-	values []string
-	ttl    time.Duration
+	kapi    client.KeysAPI
+	keys    []string
+	values  []string
+	ttl     time.Duration
+	timeout time.Duration
 }
 
-func newEtcdClient(endpoints []string, keys []string, values []string, ttl time.Duration, transport client.CancelableTransport) (*etcdClient, error) {
+func newEtcdClient(endpoints []string, keys []string, values []string, ttl time.Duration, transport client.CancelableTransport, timeout time.Duration) (*etcdClient, error) {
 	cfg := client.Config{
 		Endpoints: endpoints,
 		Transport: transport,
@@ -245,20 +262,25 @@ func newEtcdClient(endpoints []string, keys []string, values []string, ttl time.
 	}
 
 	return &etcdClient{
-		kapi:   client.NewKeysAPI(c),
-		keys:   keys,
-		values: values,
-		ttl:    ttl,
+		kapi:    client.NewKeysAPI(c),
+		keys:    keys,
+		values:  values,
+		ttl:     ttl,
+		timeout: timeout,
 	}, nil
+}
+
+func (etcd *etcdClient) cleanupKey(key string) error {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
+	defer cancel()
+	_, err := etcd.kapi.Delete(ctx, key, &client.DeleteOptions{})
+	return err
 }
 
 func (etcd *etcdClient) cleanup() error {
 	for i := 0; i < len(etcd.keys); i++ {
-		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
-		defer cancel()
-
 		key := etcd.keys[i]
-		_, err := etcd.kapi.Delete(ctx, key, &client.DeleteOptions{})
+		err := etcd.cleanupKey(key)
 		if err != nil {
 			return err
 		}
@@ -266,17 +288,23 @@ func (etcd *etcdClient) cleanup() error {
 	return nil
 }
 
+func (etcd *etcdClient) publishKey(key string, value string) error {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(etcd.timeout*time.Second))
+	defer cancel()
+
+	_, err := etcd.kapi.Set(ctx, key, value, &client.SetOptions{
+		TTL: etcd.ttl,
+	})
+	return err
+}
+
 func (etcd *etcdClient) publish() error {
 	for i := 0; i < len(etcd.keys); i++ {
-		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
-		defer cancel()
-
 		key := etcd.keys[i]
 		value := etcd.values[i]
 
-		_, err := etcd.kapi.Set(ctx, key, value, &client.SetOptions{
-			TTL: etcd.ttl,
-		})
+		err := etcd.publishKey(key, value)
+
 		if err != nil {
 			return err
 		}
