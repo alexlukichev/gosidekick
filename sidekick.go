@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"github.com/coreos/go-systemd/daemon"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -43,6 +44,7 @@ func (v *arrayFlags) Set(value string) error {
 var (
 	debug    = flag.Bool("v", false, "verbose output")
 	interval = flag.Int("i", 15, "refresh interval (sec)")
+	notify   = flag.Bool("n", false, "enable systemd notify watchdog")
 	keys     arrayFlags
 	values   arrayFlags
 )
@@ -146,7 +148,7 @@ func main() {
 	}
 
 	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGCHLD)
 	go func() {
 		s := <-sc
 		ssig := s.(syscall.Signal)
@@ -171,6 +173,28 @@ func main() {
 
 	if err := etcd.publish(); err != nil {
 		log.Errorf("Cannot publish to etcd: %s", err.Error())
+	}
+
+	if *notify {
+		go func() {
+			sdInterval, err := daemon.SdWatchdogEnabled(false)
+			if err != nil {
+				log.Errorf("Cannot enable watchdog: %s", err.Error())
+			}
+
+			if sdInterval == 0 {
+				log.Errorf("watchdog isn't enabled or we aren't the watched PID")
+				os.Exit(1)
+			}
+
+			for {
+				_, err := daemon.SdNotify(false, daemon.SdNotifyWatchdog)
+				if err != nil {
+					log.Errorf("Cannot notify systemd: %s", err.Error())
+				}
+				time.Sleep(sdInterval / 3)
+			}
+		}()
 	}
 
 OUTER_LOOP:
